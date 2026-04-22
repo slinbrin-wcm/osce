@@ -263,85 +263,6 @@ stateDiagram-v2
     已完成 --> 已关闭: 最后一轮结束
     已关闭 --> [*]
 ```
-### 4.3 多考官考站调度流程
-#### 多考官考站调度时序图
-##### 2. 关键流程说明
-
-###### 2.1 多考官协同调度特点
-1. **并行通知机制**：调度器通过消息队列同时通知考生和所有考官
-2. **就绪状态验证**：考站需等待所有考官确认就绪才能开始考试
-3. **同步开始指令**：考站向所有参与方发送同步的开始指令
-
-###### 2.2 多考官评分流程
-1. **独立评分提交**：各考官独立观察并提交评分
-2. **一致性检查**：评分服务自动检查多考官评分一致性
-3. **协同解决机制**：评分不一致时触发在线讨论流程
-4. **最终评分计算**：基于协同结果计算最终成绩
-
-###### 2.3 状态流转控制
-1. **考生状态**：待考 → 在考 → 评分中 → 完成
-2. **考站状态**：就绪 → 占用 → 评分中 → 可用
-3. **考官状态**：就绪 → 评分中 → 完成
-
-###### 3. 核心消息事件
-
-| 序号 | 事件 | 触发方 | 接收方 | 作用 |
-|------|------|--------|--------|------|
-| 4 | 考生分配事件 | 调度器 | 消息队列 | 启动考站调度流程 |
-| 19-22 | 考试开始指令 | 考站 | 考生/考官 | 同步开始考试 |
-| 51 | 评分完成事件 | 评分服务 | 消息队列 | 结束当前考站任务 |
-| 55 | 考生离站事件 | 调度器 | 消息队列 | 触发轮转调度 |
-
-###### 4. 异常处理流程
-
-```mermaid
-sequenceDiagram
-    participant Station as 考站A
-    participant Scheduler as 调度器
-    participant MQ as 消息队列
-    participant Pad as 考官PAD
-    participant Retry as 重试服务
-
-    Note over Station,Scheduler: 场景：考官设备离线
-    Station->>Pad: 1. 发送开始指令
-    Note right of Pad: 网络异常/设备离线
-    Station-->>Pad: 2. 指令发送失败
-    Station->>MQ: 3. 发布设备异常事件
-    MQ->>Scheduler: 4. 设备异常事件处理
-    Scheduler->>Scheduler: 5. 标记设备异常状态
-    
-    alt 有备用设备
-        Scheduler->>Station: 6. 分配备用设备
-        Station->>MQ: 7. 发送设备切换指令
-        MQ->>Pad: 8. 切换至备用设备
-    else 无备用设备
-        Scheduler->>Scheduler: 9. 计算异常处理方案
-        alt 启用单考官模式
-            Scheduler->>Station: 10. 启用单考官模式<br/>主考官继续评分
-        else 延迟考试
-            Scheduler->>Station: 11. 暂停当前考试
-            Scheduler->>Retry: 12. 生成重试任务
-            Retry->>MQ: 13. 发布延迟考试事件
-        end
-    end
-```
-
-###### 5. 调度器状态管理
-
-```mermaid
-stateDiagram-v2
-    [*] --> 空闲
-    空闲 --> 调度中: 接收调度请求
-    调度中 --> 分配考生: 找到合适考生
-    分配考生 --> 等待就绪: 推送考生信息
-    等待就绪 --> 考试中: 所有考官就绪
-    考试中 --> 评分中: 考试时间结束
-    评分中 --> 评分完成: 所有评分提交
-    评分完成 --> 空闲: 考生离站
-    评分完成 --> 异常: 评分不一致/超时
-    异常 --> 空闲: 异常处理完成
-    异常 --> 等待就绪: 重新分配考生
-```
 
 ## 5. 高并发与分布式部署架构
 为支持大规模、多考场同时考试，系统采用分布式集群设计。
@@ -396,6 +317,183 @@ graph TD
 8.  **监控与管理服务**：系统监控、告警、配置、运维。
 9.  **第三方集成服务**：与教务、HIS、统一认证等系统对接。
 10. **安全与合规服务**：数据加密、访问控制、审计、隐私保护。
+
+## OSCE考试系统时序图 - 多考官考站调度流程
+### 1. 多考官考站调度时序图
+```mermaid
+sequenceDiagram
+    participant Station as 考站A
+    participant Scheduler as 调度器
+    participant MQ as 消息队列
+    participant Candidate as 考生终端
+    participant PadMaster as 主考官PAD
+    participant PadSub1 as 副考官1PAD
+    participant PadSub2 as 副考官2PAD
+    participant Scoring as 评分服务
+    participant Consensus as 评分一致性服务
+
+    Note over Station: 阶段1：考站调度申请
+    Station->>Station: 1. 检查考站状态\n设备就绪\n考官就位
+    Station->>Scheduler: 2. 调度申请请求\n考站ID, 可用容量
+    Scheduler->>Scheduler: 3. 检查考生队列\n考站资源
+    Scheduler->>MQ: 4. 发布考生分配事件\n考生ID, 考站ID, 考官信息
+
+    MQ-->>Station: 5. 推送考生分配事件
+    MQ->>Candidate: 6. 推送考生信息\n考站位置, 准备时间
+    MQ->>PadMaster: 7. 推送考生信息\n考生ID, 考试信息
+    MQ->>PadSub1: 8. 推送考生信息\n考生ID, 考试信息
+    MQ->>PadSub2: 9. 推送考生信息\n考生ID, 考试信息
+
+    Note over Station: 阶段2：考生入场与准备
+    Candidate->>Candidate: 10. 考生签到确认
+    Candidate->>Station: 11. 考生就位通知
+    PadMaster->>PadMaster: 12. 主考官准备就绪
+    PadSub1->>PadSub1: 13. 副考官1准备就绪
+    PadSub2->>PadSub2: 14. 副考官2准备就绪
+    PadMaster->>Station: 15. 主考官就绪通知
+    PadSub1->>Station: 16. 副考官1就绪通知
+    PadSub2->>Station: 17. 副考官2就绪通知
+
+    Station->>Station: 18. 验证考官就绪状态
+    Station->>Candidate: 19. 发送考试开始指令
+    Station->>PadMaster: 20. 发送考试开始指令
+    Station->>PadSub1: 21. 发送考试开始指令
+    Station->>PadSub2: 22. 发送考试开始指令
+
+    Note over Station: 阶段3：考试执行与多考官评分
+    Candidate->>Candidate: 23. 考生开始考试
+    PadMaster->>PadMaster: 24. 主考官开始观察评分
+    PadSub1->>PadSub1: 25. 副考官1开始观察评分
+    PadSub2->>PadSub2: 26. 副考官2开始观察评分
+
+    par 考试进行中
+        Candidate->>Candidate: 27. 执行考试任务
+        PadMaster->>PadMaster: 28. 记录评分项
+        PadSub1->>PadSub1: 29. 记录评分项
+        PadSub2->>PadSub2: 30. 记录评分项
+    end
+
+    Note over Station: 阶段4：考试结束与评分提交
+    Candidate->>Candidate: 31. 考试时间结束
+    Candidate->>Station: 32. 考试完成通知
+    Station->>PadMaster: 33. 进入评分阶段指令
+    Station->>PadSub1: 34. 进入评分阶段指令
+    Station->>PadSub2: 35. 进入评分阶段指令
+
+    par 多考官评分
+        PadMaster->>Scoring: 36. 提交主考官评分\n考官ID:1, 评分项, 分数
+        PadSub1->>Scoring: 37. 提交副考官1评分\n考官ID:2, 评分项, 分数
+        PadSub2->>Scoring: 38. 提交副考官2评分\n考官ID:3, 评分项, 分数
+    end
+
+    Scoring->>Consensus: 39. 检查评分一致性\n考官1 vs 考官2 vs 考官3
+
+    alt 评分一致
+        Consensus-->>Scoring: 40. 评分一致，计算平均分
+    else 评分不一致
+        Consensus-->>Scoring: 41. 评分差异超过阈值\n触发协同讨论
+        Scoring->>MQ: 42. 发布评分不一致事件
+        MQ->>PadMaster: 43. 通知评分差异
+        MQ->>PadSub1: 44. 通知评分差异
+        MQ->>PadSub2: 45. 通知评分差异
+        PadMaster->>PadSub1: 46. 发起在线讨论
+        PadMaster->>PadSub2: 47. 发起在线讨论
+        PadSub1-->>PadMaster: 48. 确认讨论结果
+        PadSub2-->>PadMaster: 49. 确认讨论结果
+        PadMaster->>Scoring: 50. 提交最终协商评分
+    end
+
+    Note over Station: 阶段5：评分完成与调度确认
+    Scoring->>MQ: 51. 发布评分完成事件\n考生ID, 考站ID, 最终分数
+    MQ->>Scheduler: 52. 评分完成事件处理
+    Scheduler->>Scheduler: 53. 更新全局考试进度\n考生状态:已完成
+    Scheduler->>Station: 54. 考站任务完成确认
+    Scheduler->>MQ: 55. 发布考生离站事件
+    MQ->>Candidate: 56. 推送离站指令\n下一考站信息
+    Station->>Station: 57. 考站状态复位\n准备接待下一位考生
+```
+### 2. 关键流程说明
+2.1 多考官协同调度特点
+
+并行通知机制：调度器通过消息队列同时通知考生和所有考官
+
+就绪状态验证：考站需等待所有考官确认就绪才能开始考试
+
+同步开始指令：考站向所有参与方发送同步的开始指令
+
+2.2 多考官评分流程
+
+独立评分提交：各考官独立观察并提交评分
+
+一致性检查：评分服务自动检查多考官评分一致性
+
+协同解决机制：评分不一致时触发在线讨论流程
+
+最终评分计算：基于协同结果计算最终成绩
+
+2.3 状态流转控制
+
+考生状态：待考 → 在考 → 评分中 → 完成
+
+考站状态：就绪 → 占用 → 评分中 → 可用
+
+考官状态：就绪 → 评分中 → 完成
+
+### 3. 核心消息事件
+| 序号 | 事件 | 触发方 | 接收方 | 作用 |
+|------|------|--------|--------|------|
+| 4 | 考生分配事件 | 调度器 | 消息队列 | 启动考站调度流程 |
+| 19-22 | 考试开始指令 | 考站 | 考生/考官 | 同步开始考试 |
+| 51 | 评分完成事件 | 评分服务 | 消息队列 | 结束当前考站任务 |
+| 55 | 考生离站事件 | 调度器 | 消息队列 | 触发轮转调度 |
+### 4. 异常处理流程
+```mermaid
+sequenceDiagram
+    participant Station as 考站A
+    participant Scheduler as 调度器
+    participant MQ as 消息队列
+    participant Pad as 考官PAD
+    participant Retry as 重试服务
+
+    Note over Station,Scheduler: 场景：考官设备离线
+    Station->>Pad: 1. 发送开始指令
+    Note right of Pad: 网络异常/设备离线
+    Station-->>Pad: 2. 指令发送失败
+    Station->>MQ: 3. 发布设备异常事件
+    MQ->>Scheduler: 4. 设备异常事件处理
+    Scheduler->>Scheduler: 5. 标记设备异常状态
+    
+    alt 有备用设备
+        Scheduler->>Station: 6. 分配备用设备
+        Station->>MQ: 7. 发送设备切换指令
+        MQ->>Pad: 8. 切换至备用设备
+    else 无备用设备
+        Scheduler->>Scheduler: 9. 计算异常处理方案
+        alt 启用单考官模式
+            Scheduler->>Station: 10. 启用单考官模式<br/>主考官继续评分
+        else 延迟考试
+            Scheduler->>Station: 11. 暂停当前考试
+            Scheduler->>Retry: 12. 生成重试任务
+            Retry->>MQ: 13. 发布延迟考试事件
+        end
+    end
+```
+
+### 5. 调度器状态管理
+```mermaid
+stateDiagram-v2
+    [*] --> 空闲
+    空闲 --> 调度中: 接收调度请求
+    调度中 --> 分配考生: 找到合适考生
+    分配考生 --> 等待就绪: 推送考生信息
+    等待就绪 --> 考试中: 所有考官就绪
+    考试中 --> 评分中: 考试时间结束
+    评分中 --> 评分完成: 所有评分提交
+    评分完成 --> 空闲: 考生离站
+    评分完成 --> 异常: 评分不一致/超时
+    异常 --> 空闲: 异常处理完成
+    异常 --> 等待就绪: 重新分配考生
+```
 
 ## 7. 总结
 本OSCE系统设计以**调度引擎**和**事件驱动**为核心，通过**多考官-设备绑定机制**确保评规范，利用**分层容错**和**重考机制**保障考试流程的鲁棒性。采用**分布式架构**支持高并发场景，并通过清晰的服务划分与状态机设计，构建了一个灵活、可靠、可扩展的数字化临床技能考核平台。
